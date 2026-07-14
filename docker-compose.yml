@@ -1,0 +1,23 @@
+services:
+  home_automation:
+    build: .
+    container_name: keyfob_home_automation
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/app/data
+    # Bind-mount the WHOLE USB bus directory (not a specific /dev/bus/usb/00X/0YY
+    # device path) plus a device-cgroup-rule scoped to the entire USB class
+    # (major 189, not a specific major:minor pair). This combination matters
+    # for the unplug/replug chaos scenario: a physical replug re-enumerates the
+    # dongle to a new device node, and only a class-wide grant + live directory
+    # mount makes that new node visible to the container automatically, without
+    # restarting the container.
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    device_cgroup_rules:
+      - "c 189:* rmw"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
