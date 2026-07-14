@@ -16,7 +16,7 @@ handling, load testing).
    `apis.py` function you want each button to trigger. The shipped file has
    placeholder mappings using the id `00E1278` observed during development.
 3. Make sure nothing else on the host is using the RTL-SDR dongle (rtl_433
-   should not already be running nativel0y).
+   should not already be running natively).
 
 ## Build & run
 
