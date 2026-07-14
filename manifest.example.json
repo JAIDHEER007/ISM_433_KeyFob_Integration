@@ -1,0 +1,16 @@
+{
+  "valid_events": [
+    "YOUR_FOB_ID:1",
+    "YOUR_FOB_ID:2",
+    "YOUR_FOB_ID:3",
+    "YOUR_FOB_ID:4",
+    "YOUR_FOB_ID:8"
+  ],
+  "manifest": {
+    "YOUR_FOB_ID:1": "toggle_govee_study_light1_bright_white",
+    "YOUR_FOB_ID:2": "toggle_govee_study_light2_bright_white",
+    "YOUR_FOB_ID:3": "toggle_govee_study_lights_bright_red",
+    "YOUR_FOB_ID:4": "toggle_govee_smart_plug",
+    "YOUR_FOB_ID:8": "turn_off_all"
+  }
+}
