@@ -3,10 +3,7 @@
 Reads button presses from a 4-button Microchip HCS200 KeeLoq key fob via an
 RTL-SDR USB dongle and `rtl_433`, debounces them (3s per button), logs every
 event to SQLite, and dispatches Govee smart-light/plug actions. Runs as a
-single Docker container on a Raspberry Pi. See
-`/home/jaidheer/.claude/plans/refactored-wishing-wolf.md` for the full design
-rationale (architecture, debounce semantics, chaos-engineering/failure
-handling, load testing).
+single Docker container on a Raspberry Pi.
 
 ## Setup
 
