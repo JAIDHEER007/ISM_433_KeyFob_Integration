@@ -46,7 +46,16 @@ def _cleanup(listener_process, processor_process):
 
 
 def main():
-    db_handler.init_db()  # this process's own connection, used by the retention thread
+    # NOTE: deliberately no init_db() before the forks below. init_db() starts a
+    # writer thread, and forking a multi-threaded process is a genuine hazard -
+    # only the calling thread survives into the child, so any lock the writer
+    # thread happened to hold at that instant (SQLite's, or the allocator's) is
+    # inherited already-locked and can never be released, deadlocking the child.
+    # This parent needs a DB connection only for the retention thread, so it
+    # opens one after the children exist and it is single-threaded at fork time.
+    #
+    # init_db()'s PID guard means getting this order wrong is no longer silently
+    # fatal the way it was - but the right order costs nothing.
 
     # Bounded (maxsize=1000) as a belt-and-suspenders cap - human button mashing
     # can't realistically fill this, but it protects against a pathological
@@ -63,6 +72,7 @@ def main():
 
     logger.info(f"RTL-SDR listener PID: {listener_process.pid}, Event processor PID: {processor_process.pid}")
 
+    db_handler.init_db()  # this process's own connection, used by the retention thread
     threading.Thread(target=_retention_loop, daemon=True).start()
 
     def _signal_handler(signum, frame):
