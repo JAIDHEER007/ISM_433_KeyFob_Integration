@@ -1,8 +1,11 @@
+import json
 import os
 import queue
+import secrets
 import sqlite3
 import threading
 import time
+import uuid
 
 from logger import logger
 
@@ -17,9 +20,68 @@ DB_FILE = os.path.join(DATA_DIR, "events.db")
 # labeled, and overridable via env var.
 RETENTION_SECONDS = int(os.getenv("RETENTION_SECONDS", str(10 * 24 * 60 * 60)))
 
+# --- Trail vocabulary ------------------------------------------------------
+#
+# One row per state transition, all rows for one physical button press sharing
+# a single event_id. Stages are the pipeline components a press passes through;
+# states are what happened to it at that stage. Kept as module constants so a
+# typo is an AttributeError at import time rather than a string that silently
+# never matches a dashboard query.
+
+STAGE_RTL_LISTENER = "RTL_LISTENER"
+STAGE_EVENT_PROCESSOR = "EVENT_PROCESSOR"
+STAGE_API_HANDLER = "API_HANDLER"
+
+# RTL_LISTENER states
+STATE_RECEIVED = "RECEIVED"              # decoded a fob frame, queued it downstream
+STATE_DROPPED_REPEAT = "DROPPED_REPEAT"  # frame discarded by the repeat>0 filter
+STATE_QUEUE_FULL = "QUEUE_FULL"          # decoded, but the queue rejected it
+
+# EVENT_PROCESSOR states
+STATE_UNMAPPED = "UNMAPPED"
+STATE_DEBOUNCED = "DEBOUNCED"
+STATE_PROCESSED = "PROCESSED"
+
+# API_HANDLER states
+STATE_DISPATCHED = "DISPATCHED"  # handed to the thread pool; outcome not known yet
+STATE_SUCCESS = "SUCCESS"
+STATE_FAILED = "FAILED"
+
 _conn = None
 _write_queue = None
 _writer_thread = None
+
+
+def new_event_id():
+    """Generate a UUIDv7 string: a time-ordered id for one physical button press.
+
+    Chosen over UUIDv4 because the first 48 bits are a big-endian Unix
+    millisecond timestamp, so ids sort chronologically as plain strings, index
+    with good locality (appends land at the right edge of the B-tree instead of
+    scattering), and carry their own creation time - a trail row can be dated
+    even if its timestamp column were ever lost.
+
+    Hand-rolled rather than pulled from a dependency: uuid.uuid7() is stdlib
+    only from Python 3.14 and this runs on 3.13, and the alternative (the uuid6
+    package) is ~30 lines of code to add a whole requirement for. Layout is
+    RFC 9562 section 5.7, using the all-random method for rand_a/rand_b:
+
+        48 bits  unix_ts_ms
+         4 bits  version (0b0111)
+        12 bits  rand_a
+         2 bits  variant (0b10)
+        62 bits  rand_b
+
+    Note the all-random fill means ordering *within* a single millisecond is
+    not guaranteed - fine here, where the entire system handles a few presses
+    per second at absolute worst and cross-millisecond ordering is what the
+    trail actually depends on.
+    """
+    ts_ms = int(time.time() * 1000) & 0xFFFFFFFFFFFF
+    raw = bytearray(ts_ms.to_bytes(6, "big") + secrets.token_bytes(10))
+    raw[6] = 0x70 | (raw[6] & 0x0F)  # version 7 in the high nibble of byte 6
+    raw[8] = 0x80 | (raw[8] & 0x3F)  # RFC 4122 variant in the top 2 bits of byte 8
+    return str(uuid.UUID(bytes=bytes(raw)))
 
 
 def init_db():
@@ -54,20 +116,40 @@ def init_db():
     _conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = _conn.cursor()
 
+    # The append-only trail. Replaces the old `events` table, which held one
+    # mutable row per press whose action_result was UPDATEd in place after
+    # dispatch - that shape could only ever record the *final* outcome, and it
+    # needed update_action_result() to re-find its row by (event_key, timestamp)
+    # because the async insert never handed back a row id. Appending one row per
+    # transition instead makes the full history queryable, removes the
+    # match-on-timestamp hack, and means a new field at any stage is a payload
+    # key rather than a schema migration.
+    #
+    # An `events` table from before this change is left untouched on disk rather
+    # than migrated or dropped: nothing reads it any more, and the only
+    # deployment had zero rows in it at cutover.
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS events (
+        CREATE TABLE IF NOT EXISTS event_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_key TEXT NOT NULL,
-            model TEXT,
-            button INTEGER,
-            repeat INTEGER,
-            battery_ok INTEGER,
+            event_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            state TEXT NOT NULL,
+            event_key TEXT,
             timestamp REAL NOT NULL,
             date TEXT,
-            status TEXT NOT NULL,
-            action_result TEXT
+            payload TEXT
         )
     ''')
+
+    # event_id: the trail lookup ("show me everything that happened to this press").
+    # timestamp: retention deletes and any time-range dashboard query.
+    # state: "show me the failures", the headline dashboard query.
+    # event_key stays a real column rather than a payload key because "what did
+    # button 1 do" is a first-class question; everything genuinely ad-hoc lives
+    # in payload, queryable via json_extract(payload, '$.field') without a migration.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_log_event_id ON event_log(event_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_log_state ON event_log(state)")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS system_events (
@@ -94,7 +176,7 @@ def init_db():
 
 
 def _writer_loop():
-    """The only thread in this process allowed to touch _conn."""
+    """The only thread in this process allowed to write through _conn."""
     while True:
         job = _write_queue.get()
         try:
@@ -125,43 +207,81 @@ def _submit(job):
             logger.error("DB writer queue still full after dropping oldest - discarding this write")
 
 
-def insert_event(event_key, model, button, repeat, battery_ok, timestamp, status):
-    """Queue a button-press event row. status is one of 'processed'/'debounced'/'unmapped'."""
+def log_event(event_id, stage, state, event_key=None, payload=None, timestamp=None):
+    """Append one state-transition row to the trail. The single write primitive.
+
+    payload is any JSON-serializable dict of stage-specific detail - this is the
+    flexibility that motivated the whole change. Adding a field at any stage
+    needs no schema change, and it stays queryable via SQLite's built-in JSON1
+    functions, e.g.:
+
+        SELECT event_id, json_extract(payload, '$.error') FROM event_log
+         WHERE state = 'FAILED' ORDER BY timestamp DESC;
+
+    Serialized here on the calling thread rather than inside the queued job so
+    that a caller mutating its dict afterwards can't change what gets written,
+    and default=str keeps a stray non-serializable value (an exception object,
+    say) from killing the write outright.
+    """
+    if timestamp is None:
+        timestamp = time.time()
     date_str = time.strftime("%m%d%Y", time.localtime(timestamp))
 
+    payload_json = None
+    if payload is not None:
+        try:
+            payload_json = json.dumps(payload, default=str)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Could not serialize payload for {event_id}/{state}: {e}")
+            payload_json = json.dumps({"payload_serialization_error": str(e)})
+
     def job():
         _conn.execute(
-            "INSERT INTO events (event_key, model, button, repeat, battery_ok, timestamp, date, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (event_key, model, button, repeat, battery_ok, timestamp, date_str, status),
+            "INSERT INTO event_log (event_id, stage, state, event_key, timestamp, date, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, stage, state, event_key, timestamp, date_str, payload_json),
         )
         _conn.commit()
 
     _submit(job)
 
 
-def update_action_result(event_key, timestamp, result):
-    """Record the outcome of dispatching a button-press event's Govee action.
+def get_event_trail(event_id):
+    """Return the full ordered trail for one press as a list of dicts.
 
-    Matched on (event_key, timestamp) rather than row id, since insert_event()
-    is queued asynchronously and doesn't hand back a row id synchronously -
-    the (event_key, timestamp) pair is unique enough at this event volume.
-    result is 'success' or 'failed:<short reason>'.
+    Reads directly on the caller's thread rather than going through the writer
+    queue - the writer thread owns writes so they stay serialized, but SQLite
+    handles a concurrent read on the same connection fine, and a read that had
+    to queue behind pending writes would be useless for interactive debugging.
+
+    Rows still in the writer queue won't appear yet; this is the same eventual
+    consistency every other reader of this DB already lives with.
     """
-    def job():
-        _conn.execute(
-            "UPDATE events SET action_result = ? WHERE event_key = ? AND timestamp = ?",
-            (result, event_key, timestamp),
-        )
-        _conn.commit()
+    rows = _conn.execute(
+        "SELECT event_id, stage, state, event_key, timestamp, date, payload "
+        "FROM event_log WHERE event_id = ? ORDER BY id",
+        (event_id,),
+    ).fetchall()
 
-    _submit(job)
+    return [
+        {
+            "event_id": r[0],
+            "stage": r[1],
+            "state": r[2],
+            "event_key": r[3],
+            "timestamp": r[4],
+            "date": r[5],
+            "payload": json.loads(r[6]) if r[6] else None,
+        }
+        for r in rows
+    ]
 
 
 def insert_system_event(event_type, detail, timestamp=None):
-    """Queue a hardware/lifecycle event (sdr_down/sdr_restarting/sdr_recovered/
-    sdr_giveup_notice), kept in its own table separate from button-press events
-    so 'what did I press' and 'is my hardware healthy' don't mix."""
+    """Queue a hardware/lifecycle event (sdr_restarting/sdr_recovered/
+    sdr_giveup_notice), kept in its own table separate from the button-press
+    trail so 'what did I press' and 'is my hardware healthy' don't mix. These
+    have no event_id because they belong to no single press."""
     if timestamp is None:
         timestamp = time.time()
     date_str = time.strftime("%m%d%Y", time.localtime(timestamp))
@@ -177,23 +297,28 @@ def insert_system_event(event_type, detail, timestamp=None):
 
 
 def delete_old_events():
-    """Delete events and system_events older than RETENTION_SECONDS.
+    """Delete event_log and system_events rows older than RETENTION_SECONDS.
 
     At this project's actual event volume (a single bedroom fob), retained
     rows amount to a few MB even over many days - this was never a real disk
     risk regardless of retention policy. Kept anyway as a correctness/hygiene
     measure, run periodically from home_automation.py's background thread.
+
+    Prunes by row timestamp, so a trail spanning the cutoff loses only its
+    older rows. Harmless in practice: every row of one press is written within
+    seconds of the others, so a partial trail would need a press straddling the
+    exact cutoff instant.
     """
     def job():
         cutoff_time = time.time() - RETENTION_SECONDS
         cursor = _conn.cursor()
-        cursor.execute("DELETE FROM events WHERE timestamp < ?", (cutoff_time,))
+        cursor.execute("DELETE FROM event_log WHERE timestamp < ?", (cutoff_time,))
         deleted_events = cursor.rowcount
         cursor.execute("DELETE FROM system_events WHERE timestamp < ?", (cutoff_time,))
         deleted_system_events = cursor.rowcount
         _conn.commit()
         logger.info(
-            f"Retention cleanup: deleted {deleted_events} events, "
+            f"Retention cleanup: deleted {deleted_events} event_log rows, "
             f"{deleted_system_events} system_events older than {RETENTION_SECONDS}s."
         )
 
