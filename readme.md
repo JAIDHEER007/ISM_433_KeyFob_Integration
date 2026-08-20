@@ -5,6 +5,9 @@ RTL-SDR USB dongle and `rtl_433`, debounces them (3s per button), records an
 end-to-end trail of every event to SQLite, and dispatches Govee
 smart-light/plug actions. Runs as a single Docker container on a Raspberry Pi.
 
+Development history, design decisions and post-mortems live in
+[`Dev_log/`](Dev_log/README.md).
+
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill in your Govee API key, device MAC
@@ -150,9 +153,13 @@ sqlite3 -header -column data/events.db
 ```
 
 The file is written by the container as root but is world-readable, so no
-`sudo` is needed to read it. Reads are safe to run against the live daemon
-(`journal_mode = OFF` means a read racing a write can briefly fail with
-"database is locked" - just re-run it).
+`sudo` is needed to read it. Reads are safe to run against the live daemon:
+the DB runs in WAL mode, so readers are never blocked by the writer and you
+always see a consistent snapshot.
+
+You'll see `events.db-wal` and `events.db-shm` next to `events.db`. That's
+normal for WAL - don't delete them while the container is running, they hold
+committed data that hasn't been checkpointed back into the main file yet.
 
 Full trail for one press:
 ```sql
@@ -186,6 +193,14 @@ SELECT datetime(timestamp,'unixepoch','localtime') AS t, event_key, state
   FROM event_log
  WHERE state IN ('RECEIVED','DROPPED_REPEAT')
  ORDER BY timestamp DESC LIMIT 40;
+```
+
+Use the below command to watch for events in real time
+```
+watch -n 1 "sqlite3 -header -column data/events.db \
+  \"SELECT substr(event_id,1,8) AS id, stage, state, event_key,
+            time(timestamp,'unixepoch','localtime') AS t
+      FROM event_log ORDER BY id DESC LIMIT 20;\""
 ```
 
 Retention (`RETENTION_SECONDS`, default 10 days) prunes `event_log` and
