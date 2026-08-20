@@ -11,14 +11,23 @@ manifest.json's file path are existing seams, and monkeypatch's job is
 exactly to substitute attributes for the duration of one test.
 """
 
+import os
 import queue
 import threading
 
 import pytest
 
-import db_handler
-import event_processor as event_processor_module
-from helpers import FakeGoveeResponse
+# rtl433_listener reads FOB_IDS at import time and hard-crashes if it's unset
+# (os.getenv(...).split(...) on None). It's normally supplied by .env, which is
+# gitignored - and conftest is imported before any test module, so without this
+# a fresh clone fails during collection and takes the whole suite down. Same
+# guard as test_event_trail.py; setdefault keeps a real .env winning.
+os.environ.setdefault("FOB_IDS", "00E1278")
+
+import db_handler  # noqa: E402
+import event_processor as event_processor_module  # noqa: E402
+import rtl433_listener  # noqa: E402
+from helpers import FakeGoveeResponse  # noqa: E402
 
 
 @pytest.fixture
@@ -39,14 +48,15 @@ def isolated_db(tmp_path):
     db_handler.DB_FILE = str(tmp_path / "test_events.db")
     db_handler.init_db()
     yield db_handler
-    db_handler._conn.close()
-    db_handler._conn = None
-    db_handler._conn_pid = None
-    # Note: the writer thread started above has no shutdown sentinel (matches
-    # db_handler.py's real design - a long-lived process only ever calls
-    # init_db() once). It's left as an idle daemon thread parked on its own
-    # queue's .get() - harmless, just a bit of housekeeping debt across a test
-    # session, not a correctness issue for any test here.
+    # Retire the writer thread rather than abandoning it. An earlier version of
+    # this fixture closed the connection and left each test's writer parked on
+    # its queue forever; because _writer_loop read the module-global queue and
+    # _conn is opened with check_same_thread=False, those orphans went on
+    # picking up later tests' jobs and running them against a connection they
+    # didn't own. Two threads on one sqlite connection segfaults the
+    # interpreter - it surfaced as the suite dying mid-run once the file grew
+    # past roughly thirty db-backed tests, with no failing test to point at.
+    db_handler.shutdown_writer()
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +64,15 @@ def reset_debounce_state():
     """PROCESSED_EVENTS is in-memory, module-level state in event_processor.py
     - clear it between tests so one test's presses can't debounce another's."""
     event_processor_module.PROCESSED_EVENTS.clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_hop_code_cache():
+    """Same problem, one stage earlier: rtl433_listener._hop_codes is
+    module-level and deliberately outlives an rtl_433 restart, so without this
+    a hop code used by one test would be seen as a duplicate by the next and
+    that test's press would vanish."""
+    rtl433_listener._hop_codes.clear()
 
 
 @pytest.fixture

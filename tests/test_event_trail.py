@@ -178,28 +178,165 @@ def test_decoded_press_is_queued_and_logged_as_received(isolated_db, monkeypatch
     assert trail[0]["payload"]["raw"]["button"] == 1
 
 
-def test_repeat_frames_are_dropped_but_now_leave_evidence(isolated_db, monkeypatch, tmp_path):
-    """Behavior is unchanged - repeat>0 frames still never reach the queue -
-    but they are no longer invisible, which is what makes the 'had to press it
-    three times' symptom investigable."""
+def test_repeat_frames_without_a_hop_code_fall_back_to_the_repeat_bit(isolated_db, monkeypatch, tmp_path):
+    """The fallback path: no 'encrypted' field, so there is nothing to identify
+    the press by and the old repeat>0 filter still applies. Lossy in the way
+    entry 04 documents, but the only option when the decoder reports no code."""
     event_queue = _run_listener_stdout(monkeypatch, tmp_path, [
         {"model": "Microchip-HCS200", "id": FOB_ID, "button": 1, "repeat": 1, "battery_ok": 1},
         {"model": "Microchip-HCS200", "id": FOB_ID, "button": 1, "repeat": 2, "battery_ok": 1},
     ])
 
-    assert event_queue.empty(), "repeat frames must still be filtered out of the pipeline"
+    assert event_queue.empty(), "with no hop code, repeat frames are all we can filter on"
 
     dropped = wait_until(lambda: isolated_db._conn.execute(
         "SELECT COUNT(*) FROM event_log WHERE state = ?", (STATE_DROPPED_REPEAT,)
     ).fetchone()[0] == 2)
     assert dropped
 
-    repeats = [
-        json.loads(r[0])["repeat"] for r in isolated_db._conn.execute(
+    payloads = [
+        json.loads(r[0]) for r in isolated_db._conn.execute(
             "SELECT payload FROM event_log WHERE state = ? ORDER BY id", (STATE_DROPPED_REPEAT,)
         ).fetchall()
     ]
-    assert repeats == [1, 2]
+    assert [p["repeat"] for p in payloads] == [1, 2]
+    # Recorded so a fob silently falling back is visible in the trail rather
+    # than looking like normal hop-code de-duplication.
+    assert [p["dedup_by"] for p in payloads] == ["repeat_bit", "repeat_bit"]
+
+
+# --- The entry-04 bug: burst de-duplication by hop code --------------------
+
+def _frame(button, repeat, hop_code):
+    return {"model": "Microchip-HCS200", "id": FOB_ID, "button": button,
+            "repeat": repeat, "battery_ok": 1, "encrypted": hop_code}
+
+
+def test_press_survives_losing_its_leading_repeat_zero_frame(isolated_db, monkeypatch, tmp_path):
+    """The regression test for entry 04. The repeat=0 frame never arrives - the
+    exact case that used to discard the whole press, measured at 52% of presses
+    - so the first retransmission to arrive must carry it instead."""
+    event_queue = _run_listener_stdout(monkeypatch, tmp_path, [
+        _frame(4, 1, "07ECB111"),
+        _frame(4, 1, "07ECB111"),
+        _frame(4, 1, "07ECB111"),
+    ])
+
+    event = event_queue.get_nowait()
+    assert event["button"] == 4
+    assert event["repeat"] == 1, "the frame that got through was a retransmission"
+    assert event_queue.empty(), "the remaining frames are the same press, not new ones"
+
+    trail = wait_until(lambda: db_handler.get_event_trail(event["event_id"]) or None)
+    assert trail[0]["state"] == STATE_RECEIVED
+    assert trail[0]["payload"]["hop_code"] == "07ECB111"
+
+    dropped = wait_until(lambda: isolated_db._conn.execute(
+        "SELECT COUNT(*) FROM event_log WHERE state = ?", (STATE_DROPPED_REPEAT,)
+    ).fetchone()[0] == 2)
+    assert dropped
+
+
+def test_distinct_presses_half_a_second_apart_are_not_merged(isolated_db, monkeypatch, tmp_path):
+    """Two real presses of the same button, closer together than a single burst
+    is wide. A time-window filter would collapse these into one; distinct hop
+    codes keep them distinct, which is why the fix keys on identity."""
+    event_queue = _run_listener_stdout(monkeypatch, tmp_path, [
+        _frame(8, 0, "7959CA04"),
+        _frame(8, 1, "7959CA04"),
+        _frame(8, 0, "9D3DD2D1"),
+        _frame(8, 1, "9D3DD2D1"),
+    ])
+
+    first = event_queue.get_nowait()
+    second = event_queue.get_nowait()
+    assert event_queue.empty()
+    assert first["event_id"] != second["event_id"]
+
+    def both_rows_written():
+        rows = isolated_db._conn.execute(
+            "SELECT json_extract(payload, '$.hop_code') FROM event_log "
+            "WHERE state = ? ORDER BY id", (STATE_RECEIVED,)
+        ).fetchall()
+        return rows if len(rows) == 2 else None
+
+    received = wait_until(both_rows_written)
+    assert [r[0] for r in received] == ["7959CA04", "9D3DD2D1"]
+
+
+def test_a_whole_burst_collapses_to_one_press(isolated_db, monkeypatch, tmp_path):
+    """The behaviour the old filter got right, which must not regress: one
+    physical press dispatches exactly one action, however many frames it took."""
+    event_queue = _run_listener_stdout(monkeypatch, tmp_path, [
+        _frame(1, 0, "EE3E4730"),
+        _frame(1, 1, "EE3E4730"),
+        _frame(1, 1, "EE3E4730"),
+        _frame(1, 1, "EE3E4730"),
+    ])
+
+    event = event_queue.get_nowait()
+    assert event["repeat"] == 0, "the leading frame arrived, so it wins"
+    assert event_queue.empty()
+
+    assert wait_until(lambda: isolated_db._conn.execute(
+        "SELECT COUNT(*) FROM event_log WHERE state = ?", (STATE_DROPPED_REPEAT,)
+    ).fetchone()[0] == 3)
+
+
+def test_hop_code_is_forgotten_after_its_ttl(isolated_db, monkeypatch, tmp_path):
+    """Codes must not be remembered forever - the cache is a burst window, not
+    a permanent replay ledger, and a fob that ever reused a code would
+    otherwise go permanently dead for that button."""
+    monkeypatch.setattr(rtl433_listener, "HOP_CODE_TTL_SECONDS", 0.05)
+
+    _run_listener_stdout(monkeypatch, tmp_path, [_frame(2, 0, "A0DBB93C")])
+    time.sleep(0.1)
+    event_queue = _run_listener_stdout(monkeypatch, tmp_path, [_frame(2, 0, "A0DBB93C")])
+
+    assert not event_queue.empty(), "code should have expired and been accepted again"
+
+
+def test_hop_code_cache_is_bounded(isolated_db, monkeypatch, tmp_path):
+    """The memory ceiling. TTL eviction normally keeps the cache tiny; this
+    checks the cap holds even if a decoder emits codes faster than they expire."""
+    monkeypatch.setattr(rtl433_listener, "HOP_CODE_CACHE_MAX", 8)
+
+    _run_listener_stdout(monkeypatch, tmp_path,
+                         [_frame(1, 0, f"CODE{i:04X}") for i in range(50)])
+
+    assert len(rtl433_listener._hop_codes) <= 8
+
+
+def test_queue_full_releases_the_code_so_the_burst_can_retry(isolated_db, monkeypatch, tmp_path):
+    """Backpressure must not silently consume the press. The first frame fails
+    to queue, so a retransmission has to be allowed to carry it instead -
+    otherwise the fix trades one silent loss for another."""
+    monkeypatch.setattr(rtl433_listener, "FOB_MODEL", "Microchip-HCS200")
+    monkeypatch.setattr(rtl433_listener, "FOB_IDS", {FOB_ID})
+    monkeypatch.setattr(rtl433_listener, "HEARTBEAT_FILE", str(tmp_path / "heartbeat"))
+
+    accepted = []
+
+    class OneShotFullQueue:
+        """Rejects the first put (queue momentarily full), accepts afterwards."""
+
+        def __init__(self):
+            self.puts = 0
+
+        def put(self, event, block=True, timeout=None):
+            self.puts += 1
+            if self.puts == 1:
+                raise queue.Full
+            accepted.append(event)
+
+    stream = io.StringIO("".join(json.dumps(f) + "\n" for f in [
+        _frame(4, 0, "C0EBBC38"),
+        _frame(4, 1, "C0EBBC38"),
+    ]))
+    rtl433_listener._read_stdout(stream, rtl433_listener._SubprocessState(), OneShotFullQueue())
+
+    assert len(accepted) == 1, "the retransmission must be allowed to carry the press"
+    assert accepted[0]["repeat"] == 1
 
 
 def test_other_devices_are_not_written_to_the_trail(isolated_db, monkeypatch, tmp_path):
