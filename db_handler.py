@@ -48,6 +48,7 @@ STATE_SUCCESS = "SUCCESS"
 STATE_FAILED = "FAILED"
 
 _conn = None
+_conn_pid = None  # PID that opened _conn, so a forked child can tell it inherited one
 _write_queue = None
 _writer_thread = None
 
@@ -104,16 +105,40 @@ def init_db():
     completion order. Replaced with one dedicated writer thread per process,
     draining a small bounded queue - bounded thread count, and backpressure
     (drop-oldest with a logged warning) if the writer ever falls behind.
+
+    The guard below is keyed on the owning PID rather than merely "is _conn
+    set", because the plain None-check silently defeated everything above.
+    home_automation.py initializes the DB in the parent before forking, so a
+    child inherited a non-None _conn and its own init_db() call returned
+    immediately - never opening a connection, and never starting a writer
+    thread, since fork() copies only the calling thread. Both children were
+    therefore queueing every write onto a queue with no consumer: no
+    connection error, no exception, just rows accumulating in memory until the
+    bounded queue began discarding them. That is why nothing the listener or
+    event processor recorded ever reached the file, while the parent's own
+    retention writes worked fine.
     """
-    global _conn, _write_queue, _writer_thread
+    global _conn, _write_queue, _writer_thread, _conn_pid
+
+    if _conn is not None and _conn_pid == os.getpid():
+        return  # already initialized in *this* process
 
     if _conn is not None:
-        return  # already initialized in this process
+        # Inherited across fork. Drop the references without close()-ing: the
+        # object was duplicated mid-flight along with whatever locks its
+        # internals held, and closing it here could flush the parent's cached
+        # pages into a file the parent is still writing to. Letting it be
+        # garbage collected unclosed leaks one fd in the child, which is a far
+        # cheaper problem than corrupting the database.
+        _conn = None
+        _write_queue = None
+        _writer_thread = None
 
     if DATA_DIR and not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
 
     _conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    _conn_pid = os.getpid()
     cursor = _conn.cursor()
 
     # The append-only trail. Replaces the old `events` table, which held one
@@ -161,10 +186,32 @@ def init_db():
         )
     ''')
 
-    # Same lightweight-optimization pragmas as the old code - this is a
-    # low-throughput hobby logger, favoring write speed over crash durability.
-    cursor.execute("PRAGMA synchronous = OFF;")
-    cursor.execute("PRAGMA journal_mode = OFF;")
+    # The old pragmas were `journal_mode = OFF` + `synchronous = OFF`, chosen
+    # for write speed on the assumption that a hobby logger can afford to lose
+    # recent rows in a crash. That assumption was safe only by accident: the
+    # fork bug meant just one process ever actually wrote. With the PID guard
+    # above, all three processes now write concurrently, and those settings
+    # become actively wrong:
+    #
+    #   journal_mode = OFF removes the rollback journal, so an interrupted
+    #   write cannot be undone - with multiple writers that risks a corrupt
+    #   file rather than merely a lost row.
+    #
+    #   With no busy timeout, a writer that finds the database locked by
+    #   another process fails immediately with "database is locked". The
+    #   writer thread would catch and log it, and the row would be gone -
+    #   trading a silent loss for a noisier one.
+    #
+    # WAL is built for exactly this shape (multiple processes, one writer at a
+    # time, readers never blocked), and with synchronous = NORMAL it stays
+    # fast: a power cut may drop the last transactions but cannot corrupt the
+    # file. At a few button presses a day the write cost is irrelevant.
+    #
+    # Note journal_mode is persisted in the database file itself, unlike the
+    # other pragmas - setting it once here sticks across restarts.
+    cursor.execute("PRAGMA journal_mode = WAL;")
+    cursor.execute("PRAGMA synchronous = NORMAL;")
+    cursor.execute("PRAGMA busy_timeout = 5000;")  # wait out another process's write, don't fail
     cursor.execute("PRAGMA temp_store = MEMORY;")
     cursor.execute("PRAGMA cache_size = -5000;")
     cursor.execute("PRAGMA optimize;")
