@@ -142,9 +142,17 @@ single press, so they have no `event_id`.
 
 ### Querying it
 
+`./data` is bind-mounted into the container, so query the DB from the **host** -
+the runtime image has no `sqlite3` CLI in it:
+
 ```
-docker compose exec home_automation sqlite3 -header -column /app/data/events.db
+sqlite3 -header -column data/events.db
 ```
+
+The file is written by the container as root but is world-readable, so no
+`sudo` is needed to read it. Reads are safe to run against the live daemon
+(`journal_mode = OFF` means a read racing a write can briefly fail with
+"database is locked" - just re-run it).
 
 Full trail for one press:
 ```sql
