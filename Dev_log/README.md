@@ -13,8 +13,9 @@ duplicate it.
 | # | Phase | Date | Branch | Status |
 |---|---|---|---|---|
 | [01](01-initial-build.md) | Initial build — RTL-SDR pipeline, Docker, tests | 2026-07-10 → 07-14 | `main` / `dev` | Shipped |
-| [02](02-e2e-event-store.md) | End-to-end event store (UUIDv7 trail) + fork-bug fix | 2026-08-20 | `feature/e2e_event_store` | In review |
+| [02](02-e2e-event-store.md) | End-to-end event store (UUIDv7 trail) + fork-bug fix | 2026-08-20 | `feature/e2e_event_store` | Shipped |
 | [03](03-govee-api-outputs.md) | Govee API response logging | — | `feature/govee_api_outputs` | Planned |
+| [04](04-repeat-frame-drop.md) | Lost presses — `repeat > 0` filter drops whole bursts | found 2026-08-20 | `feature/repeat_frame_drop` | Diagnosed |
 
 ## The runtime pipeline
 

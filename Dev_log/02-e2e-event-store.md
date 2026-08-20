@@ -98,6 +98,9 @@ is discarded and previously left no trace. These frames are now recorded with
 the raw decoded JSON before being dropped. A run of `DROPPED_REPEAT` with no
 `RECEIVED` before it is that failure, caught.
 
+> It was caught. The first capture shows 52% of presses lost this way — see
+> [entry 04](04-repeat-frame-drop.md).
+
 **`suppressed_by_event_id`** — `PROCESSED_EVENTS` now stores
 `(timestamp, event_id)`, so a `DEBOUNCED` row names the press that silenced it,
 along with `gap_seconds` and `window_seconds`. Because the debounce window is
