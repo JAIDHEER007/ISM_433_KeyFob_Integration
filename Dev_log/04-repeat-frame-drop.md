@@ -1,8 +1,8 @@
 # 04 — Lost presses: the `repeat > 0` filter drops whole bursts
 
 **Date found:** 2026-08-20
-**Branch:** `feature/repeat_frame_drop` (to branch from `dev` after entry 02 merges)
-**Status:** Diagnosed — confirmed against live data, fix not started
+**Branch:** `bug-fix/repeat-frame-drop` (from `dev`)
+**Status:** Fixed — implemented and verified by replaying the capture
 
 The "had to press it three times" symptom from
 [entry 02](02-e2e-event-store.md) has a cause, and the trail proves it.
@@ -113,23 +113,13 @@ deliberate ones.
 
 The hopping code has no such ambiguity, which is why the fix should key on it.
 
-## Proposed fix
+## The fix
 
 **Dedupe on the hopping code, not on the repeat bit.** Accept the first frame
 of a burst whatever its `repeat` value; drop later frames because their
 hopping code was already seen, not because a bit is set.
 
-```python
-# Sketch. SEEN_CODES: OrderedDict[str, float], code -> first-seen timestamp.
-code = data.get("encrypted")
-if code is not None and code in SEEN_CODES:
-    db_handler.log_event(..., STATE_DROPPED_REPEAT,
-                         payload={"repeat": repeat, "hop_code": code, "raw": data})
-    continue
-SEEN_CODES[code] = time.time()   # evict entries older than ~10s, cap the size
-```
-
-Properties this has that the current filter doesn't:
+Properties this has that the old filter didn't:
 
 - A press survives losing its first frame, second frame, or any subset —
   whichever frame arrives first wins. That is what the retransmissions are for.
@@ -137,27 +127,71 @@ Properties this has that the current filter doesn't:
 - Replayed frames are dropped for free, since a replay carries an already-seen
   code.
 
-Points to settle when implementing:
+### What was implemented
 
-- **Eviction.** ~10s and a bounded size is ample — the widest burst is 2.62s,
-  and codes only need to outlive their own burst. Must be bounded; an
-  unbounded set grows for the life of the process.
-- **Missing `encrypted`.** A future producer, or a fob whose decoder omits the
-  field, needs a fallback. Falling back to the *current* behaviour for those
-  frames keeps the change contained.
-- **`DROPPED_REPEAT` keeps its meaning** but gains precision: after the fix it
-  means "same press, already forwarded", which is what it was always supposed
-  to mean. Record `hop_code` in the payload so a future regression is one
-  query away.
-- **Counter desync is out of scope.** The receiver never validates the KeeLoq
-  counter, so nothing here can drift out of sync; presses are matched by
-  identity, not by sequence.
+`rtl433_listener.py` keeps an `OrderedDict` of `"<device id>:<hop code>" ->
+first-seen time`, and `_seen_before()` does check-and-insert atomically under a
+lock. A frame whose code is already there is dropped; anything else is
+forwarded.
 
-### Cheaper alternative, and why it isn't the recommendation
+- **Eviction: 10s TTL plus a 512-entry cap.** A code only has to outlive its
+  own burst, and the widest observed burst is 2.62s. The cap is a memory
+  ceiling, not a tuning knob — TTL eviction keeps the real cache at a handful
+  of entries.
+- **TTL measured on `time.monotonic()`, not `time.time()`.** A wall-clock step
+  — NTP correcting a Pi that boots with no RTC, which is this host — would
+  otherwise expire codes early or strand them indefinitely. Trail rows still
+  record wall-clock time.
+- **Keyed on device id, not on button.** A frame whose button bits decoded
+  wrong would otherwise look like a fresh press and fire a second, wrong
+  action. HCS200 frames carry no CRC, so dropping such a frame as a duplicate
+  is the safe direction to be wrong in.
+- **Cache is module-level and survives an `rtl_433` restart**, so a burst
+  straddling a restart is still one press. It's lock-guarded because the
+  supervisor can start a new stdout reader while the previous one is still
+  draining a closed pipe.
+- **Fallback when the frame carries no hop code** (a future producer, or a
+  decoder that omits it): the old `repeat > 0` filter still applies, confined
+  to that branch so it can never affect a fob that does report a code.
+- **`DROPPED_REPEAT` now means what its name always claimed** — same press,
+  already forwarded. The payload gained `hop_code` and `dedup_by`
+  (`"hop_code"` / `"repeat_bit"`), so a regression, or a fob silently falling
+  back, is one query away. `RECEIVED` rows carry `hop_code` too, so both
+  states group on the same `json_extract` path.
+
+**Queue-full interaction, found while implementing.** The listener drops a
+press when the downstream queue is full. Claiming the hop code before that
+check would have traded one silent loss for another: the first frame claims
+the press, fails to queue it, and every retransmission that could still have
+carried it is then dropped as a duplicate. The code is now released on
+`QUEUE_FULL`, so a later frame of the same burst can retry — the fob's
+redundancy applied to backpressure as well as to lost frames.
+
+**Counter desync stays out of scope.** The receiver never validates the KeeLoq
+counter, so nothing here can drift out of sync; presses are matched by
+identity, not by sequence.
+
+### Verification
+
+Replaying the 134 captured frames from `data/events.db` through the patched
+`_read_stdout()`:
+
+| | before | after |
+|---|---|---|
+| Presses forwarded downstream | 22 / 46 | **46 / 46** |
+| Duplicate dispatches | 0 | **0** |
+
+Every dropped frame was dropped by the `hop_code` rule; none fell back to the
+repeat bit. Seven new tests in `test_event_trail.py` cover it: a press whose
+leading `repeat=0` frame never arrives, two distinct presses 0.52s apart not
+merging, a full burst collapsing to one dispatch, TTL expiry, the cache bound,
+the queue-full retry, and the no-hop-code fallback.
+
+### Cheaper alternative, and why it wasn't taken
 
 Removing the `repeat > 0` filter entirely and letting the existing 3s debounce
 in `event_processor.py` absorb the retransmissions would work on this
-capture — every burst spans less than 3s. It is not the recommendation:
+capture — every burst spans less than 3s. It was rejected:
 
 - 2.62s against a 3s window is 87% of the budget. A slightly longer burst
   fires the action twice.
@@ -165,8 +199,29 @@ capture — every burst spans less than 3s. It is not the recommendation:
   stop distinguishing "human pressed twice" from "radio sent the same frame
   five times" — which throws away the diagnostic value entry 02 was built for.
 
-Worth keeping as a fallback if the hopping code turns out to be unreliable in
-wider testing, but the ordering is clear.
+Still worth reaching for if the hopping code turns out to be unreliable in
+wider testing, but nothing so far suggests it will be.
+
+### Unrelated bug found and fixed on this branch
+
+Adding those tests made the suite segfault mid-run, with no failing test to
+point at. It was not caused by the new tests — six trivial extra DB-backed
+tests reproduce it on unmodified `dev`.
+
+`isolated_db` opened a fresh connection per test and abandoned each test's
+writer thread. Because `_writer_loop()` read the module-global `_write_queue`
+and `_conn` is opened with `check_same_thread=False`, those orphaned writers
+kept picking up later tests' jobs and running them against a connection they
+did not own. Two threads on one SQLite connection segfaults the interpreter
+rather than raising, and the suite only crossed the threshold at roughly thirty
+DB-backed tests — so it would have landed on whoever next added a few.
+
+Fixed at the root: `_writer_loop()` now takes its queue as an argument, so a
+retired writer is unreachable, and `db_handler.shutdown_writer()` drains and
+stops it (queued jobs run first — the sentinel goes through the same FIFO).
+The fixture calls that instead of closing the connection out from under a live
+thread. Production behaviour is unchanged: it calls `init_db()` once and never
+shuts the writer down.
 
 ## Follow-on question, not part of this fix
 
@@ -178,8 +233,9 @@ Once the listener stops losing presses, it is worth re-checking whether any
 remaining "nothing happened" reports are this instead — the query is
 `DEBOUNCED` rows joined to a `FAILED` outcome on `suppressed_by_event_id`.
 
-## Prerequisite
+## Built on
 
-Entry 02 must be merged first — the diagnosis above is built entirely on the
-`event_log` trail and the `payload` column it introduced, and the fix extends
-the `DROPPED_REPEAT` rows it added.
+Entry 02 — the diagnosis rests entirely on the `event_log` trail and the
+`payload` column it introduced, and the fix extends the `DROPPED_REPEAT` rows
+it added. The bug was found by the very evidence that entry was written to
+collect.
