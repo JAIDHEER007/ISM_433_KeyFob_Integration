@@ -120,23 +120,69 @@ def _read_stdout(stream, state, event_queue):
         model = data.get("model")
         device_id = data.get("id")
         if model != FOB_MODEL or device_id not in FOB_IDS:
-            continue  # some other decoded device, or doesn't match our known fob(s)
+            # Some other decoded device, or not one of our fobs. Deliberately
+            # NOT written to the trail - ambient 433MHz traffic (neighbours'
+            # sensors, car fobs) is continuous, and logging it would bury the
+            # rows that matter under noise.
+            continue
 
-        if data.get("repeat", 0) > 0:
-            continue  # protocol-level retransmission of the same physical press, not a new one
+        # This is the head of the trail: every downstream row for this press
+        # carries this same id, which is what makes the end-to-end query work.
+        event_id = db_handler.new_event_id()
+        button = data.get("button")
+        event_key = f"{device_id}:{button}"
+        repeat = data.get("repeat", 0)
+
+        if repeat > 0:
+            # Protocol-level retransmission of the same physical press, not a
+            # new one - dropped here, as before. Now recorded first, because
+            # this filter is a prime suspect for the "had to press it three
+            # times" symptom: HCS200 sets the repeat bit on every frame after
+            # the first in a burst, so if the leading repeat=0 frame is the one
+            # that gets corrupted, this branch silently discards the entire
+            # press. A run of DROPPED_REPEAT rows with no RECEIVED row before
+            # them is exactly that failure, and previously left no evidence at
+            # all. The raw frame is kept so the theory can be checked against
+            # real captures rather than re-derived from behavior.
+            db_handler.log_event(
+                event_id,
+                db_handler.STAGE_RTL_LISTENER,
+                db_handler.STATE_DROPPED_REPEAT,
+                event_key=event_key,
+                payload={"repeat": repeat, "raw": data},
+            )
+            continue
 
         event = {
+            "event_id": event_id,
             "device_id": device_id,
             "model": model,
-            "button": data.get("button"),
-            "repeat": data.get("repeat", 0),
+            "button": button,
+            "repeat": repeat,
             "battery_ok": data.get("battery_ok"),
             "timestamp": time.time(),
         }
+        db_handler.log_event(
+            event_id,
+            db_handler.STAGE_RTL_LISTENER,
+            db_handler.STATE_RECEIVED,
+            event_key=event_key,
+            payload={"raw": data},
+            timestamp=event["timestamp"],
+        )
         try:
             event_queue.put(event, block=True, timeout=1)
         except Exception:
             logger.warning("Event queue full - dropping button-press event to avoid unbounded memory growth")
+            # Trail row so a press lost to backpressure is distinguishable from
+            # one that was never decoded at all - the RECEIVED row above says
+            # the RF side worked, this one says the pipeline dropped it.
+            db_handler.log_event(
+                event_id,
+                db_handler.STAGE_RTL_LISTENER,
+                db_handler.STATE_QUEUE_FULL,
+                event_key=event_key,
+            )
     stream.close()
 
 

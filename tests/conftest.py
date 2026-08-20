@@ -33,6 +33,7 @@ def isolated_db(tmp_path):
     reset to force a fresh connection + writer thread scoped to this test.
     """
     db_handler._conn = None
+    db_handler._conn_pid = None
     db_handler._write_queue = None
     db_handler._writer_thread = None
     db_handler.DB_FILE = str(tmp_path / "test_events.db")
@@ -40,6 +41,7 @@ def isolated_db(tmp_path):
     yield db_handler
     db_handler._conn.close()
     db_handler._conn = None
+    db_handler._conn_pid = None
     # Note: the writer thread started above has no shutdown sentinel (matches
     # db_handler.py's real design - a long-lived process only ever calls
     # init_db() once). It's left as an idle daemon thread parked on its own

@@ -19,13 +19,13 @@ def delete_old_events():
     try:
         cutoff_time = time.time() - RETENTION_SECONDS
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM events WHERE timestamp < ?", (cutoff_time,))
+        cursor.execute("DELETE FROM event_log WHERE timestamp < ?", (cutoff_time,))
         deleted_events = cursor.rowcount
         cursor.execute("DELETE FROM system_events WHERE timestamp < ?", (cutoff_time,))
         deleted_system_events = cursor.rowcount
         conn.commit()
         logger.info(
-            f"Retention cleanup: deleted {deleted_events} events, "
+            f"Retention cleanup: deleted {deleted_events} event_log rows, "
             f"{deleted_system_events} system_events older than {RETENTION_SECONDS}s."
         )
     except Exception as e:
