@@ -34,7 +34,7 @@ STAGE_API_HANDLER = "API_HANDLER"
 
 # RTL_LISTENER states
 STATE_RECEIVED = "RECEIVED"              # decoded a fob frame, queued it downstream
-STATE_DROPPED_REPEAT = "DROPPED_REPEAT"  # frame discarded by the repeat>0 filter
+STATE_DROPPED_REPEAT = "DROPPED_REPEAT"  # duplicate frame of an already-forwarded press
 STATE_QUEUE_FULL = "QUEUE_FULL"          # decoded, but the queue rejected it
 
 # EVENT_PROCESSOR states
@@ -51,6 +51,10 @@ _conn = None
 _conn_pid = None  # PID that opened _conn, so a forked child can tell it inherited one
 _write_queue = None
 _writer_thread = None
+
+# Queued in place of a job to retire a writer thread. A sentinel object rather
+# than None so a caller accidentally submitting None can't stop the writer.
+_WRITER_STOP = object()
 
 
 def new_event_id():
@@ -218,18 +222,56 @@ def init_db():
     _conn.commit()
 
     _write_queue = queue.Queue(maxsize=500)
-    _writer_thread = threading.Thread(target=_writer_loop, daemon=True)
+    _writer_thread = threading.Thread(target=_writer_loop, args=(_write_queue,), daemon=True)
     _writer_thread.start()
 
 
-def _writer_loop():
-    """The only thread in this process allowed to write through _conn."""
+def _writer_loop(write_queue):
+    """The only thread in this process allowed to write through _conn.
+
+    Takes its queue as an argument rather than reading the module global. A
+    process normally calls init_db() exactly once, but where it is called again
+    (the test suite retargets DB_FILE per test) reading the global would let a
+    writer belonging to a retired connection pull jobs meant for its
+    replacement - and since _conn is opened with check_same_thread=False, two
+    writer threads running jobs against one connection segfaults the
+    interpreter rather than raising. Binding the queue at thread start makes an
+    old writer unreachable instead.
+    """
     while True:
-        job = _write_queue.get()
+        job = write_queue.get()
+        if job is _WRITER_STOP:
+            return
         try:
             job()
         except Exception as e:
             logger.error(f"Database write error: {e}")
+
+
+def shutdown_writer():
+    """Drain and stop this process's writer thread, then close its connection.
+
+    Production never calls this - the writer runs for the life of the process
+    and Docker's SIGTERM takes the whole container down. It exists so a caller
+    that opens connections repeatedly can retire one deterministically instead
+    of leaving the thread parked forever on a queue nothing will feed again.
+
+    Jobs already queued run first (the sentinel goes through the same FIFO), so
+    stopping never silently discards a pending write.
+    """
+    global _conn, _conn_pid, _write_queue, _writer_thread
+
+    if _write_queue is not None:
+        _write_queue.put(_WRITER_STOP)
+    if _writer_thread is not None:
+        _writer_thread.join(timeout=5)
+    if _conn is not None:
+        _conn.close()
+
+    _conn = None
+    _conn_pid = None
+    _write_queue = None
+    _writer_thread = None
 
 
 def _submit(job):
