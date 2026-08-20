@@ -12,6 +12,12 @@ lets a future second producer (e.g. a revived CC1101/ESP32 UDP listener) be
 added as another process feeding the same queue, without touching this file or
 the consumer at all.
 
+A fob press is transmitted as a burst of identical frames, so this module is
+also where a burst is collapsed back into one press: frames are de-duplicated
+by their KeeLoq hop code, which is unique per press. The earlier filter keyed
+on the frame's repeat bit instead and lost any press whose leading frame was
+corrupted - see Dev_log/04-repeat-frame-drop.md for the measurement.
+
 Also acts as a supervisor: rtl_433 is restarted with exponential backoff if it
 dies or hangs, and failures are diagnosed and surfaced (see Chaos Engineering
 section of the design plan) rather than silently retried forever.
@@ -23,6 +29,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 
 import db_handler
 from logger import logger
@@ -31,6 +38,23 @@ from logger import logger
 
 FOB_MODEL = os.getenv("FOB_MODEL", "Microchip-HCS200")
 FOB_IDS = {i.strip() for i in os.getenv("FOB_IDS").split(",") if i.strip()}
+
+# rtl_433's field name for the HCS200's 32-bit KeeLoq hopping code. It changes
+# on every press, so it identifies a physical press outright - which is what
+# lets burst de-duplication key on identity instead of on the repeat bit or on
+# a time window. See Dev_log/04-repeat-frame-drop.md.
+HOP_CODE_FIELD = os.getenv("HOP_CODE_FIELD", "encrypted")
+
+# A code only has to outlive its own burst. The widest burst in the captured
+# data spans 2.6s, so 10s is ~4x headroom while staying far below the interval
+# at which a fob could plausibly cycle back to the same code.
+HOP_CODE_TTL_SECONDS = float(os.getenv("HOP_CODE_TTL_SECONDS", "10"))
+
+# Hard cap so the cache can never grow without bound if TTL eviction somehow
+# doesn't keep up (a decoder emitting garbage codes at speed, say). At the real
+# frame rate this is never reached; it exists as a memory ceiling, not a tuning
+# knob.
+HOP_CODE_CACHE_MAX = 512
 
 # rtl_433 protocol id for Microchip HCS200/HCS300 KeeLoq (OOK variant). Confirmed
 # against rtl_433 25.02's protocol list; if it ever mismatches after an rtl_433
@@ -84,6 +108,53 @@ class _SubprocessState:
         self.last_stderr = ""
 
 
+# --- Burst de-duplication --------------------------------------------------
+#
+# hop-code key -> monotonic time first seen. Module-level, so it survives an
+# rtl_433 restart: a burst straddling a restart is still one press. Guarded by
+# a lock because the supervisor can start a new stdout reader thread while the
+# previous one is still draining a closed pipe.
+#
+# monotonic() rather than time.time(): this is a TTL, and a wall-clock step
+# (NTP correcting a clock that started wrong on a box with no RTC - the normal
+# case for the Pi this runs on) would otherwise expire entries early or keep
+# them alive indefinitely. Trail rows still record wall-clock time.
+_hop_codes = OrderedDict()
+_hop_codes_lock = threading.Lock()
+
+
+def _seen_before(key):
+    """True if this hop code was already handled; otherwise record it and return False.
+
+    Check-and-insert is one atomic step so two reader threads can't both
+    conclude they saw a frame first and dispatch the same press twice.
+    """
+    now = time.monotonic()
+    with _hop_codes_lock:
+        # Insertion order is time order, so eviction stops at the first live
+        # entry instead of scanning the whole cache.
+        cutoff = now - HOP_CODE_TTL_SECONDS
+        while _hop_codes:
+            oldest_seen_at = next(iter(_hop_codes.values()))
+            if oldest_seen_at > cutoff:
+                break
+            _hop_codes.popitem(last=False)
+
+        if key in _hop_codes:
+            return True
+
+        _hop_codes[key] = now
+        while len(_hop_codes) > HOP_CODE_CACHE_MAX:
+            _hop_codes.popitem(last=False)
+        return False
+
+
+def _forget(key):
+    """Un-record a hop code, so a later frame of the same burst can claim the press."""
+    with _hop_codes_lock:
+        _hop_codes.pop(key, None)
+
+
 _last_heartbeat_write = 0
 
 
@@ -133,23 +204,51 @@ def _read_stdout(stream, state, event_queue):
         event_key = f"{device_id}:{button}"
         repeat = data.get("repeat", 0)
 
-        if repeat > 0:
-            # Protocol-level retransmission of the same physical press, not a
-            # new one - dropped here, as before. Now recorded first, because
-            # this filter is a prime suspect for the "had to press it three
-            # times" symptom: HCS200 sets the repeat bit on every frame after
-            # the first in a burst, so if the leading repeat=0 frame is the one
-            # that gets corrupted, this branch silently discards the entire
-            # press. A run of DROPPED_REPEAT rows with no RECEIVED row before
-            # them is exactly that failure, and previously left no evidence at
-            # all. The raw frame is kept so the theory can be checked against
-            # real captures rather than re-derived from behavior.
+        # De-duplicate the burst by hop code, NOT by the repeat bit. The bit
+        # means "this is not the first frame the fob *sent*", which says nothing
+        # about whether we received that first frame - so the old `repeat > 0`
+        # test discarded the entire press whenever the leading repeat=0 frame
+        # was the one lost to interference. That was measured at 52% of presses
+        # in the first capture; see Dev_log/04-repeat-frame-drop.md.
+        #
+        # Keying on the hop code instead means whichever frame arrives first
+        # wins, which is exactly what the fob's retransmissions are for. A time
+        # window can't substitute: bursts run up to 2.6s while two genuinely
+        # distinct presses were seen 0.52s apart, so no threshold separates
+        # them. Replays are dropped for free, since a replayed frame carries an
+        # already-seen code.
+        hop_code = data.get(HOP_CODE_FIELD)
+        hop_key = None
+        if hop_code is not None:
+            # Keyed on device id, deliberately not on button: a frame whose
+            # button bits decoded wrong would otherwise look like a new press
+            # and fire a second, wrong action. HCS200 frames carry no CRC, so
+            # that is worth guarding against - dropping such a frame as a
+            # duplicate is the safe direction to be wrong in.
+            hop_key = f"{device_id}:{hop_code}"
+            duplicate = _seen_before(hop_key)
+            dedup_by = "hop_code"
+        else:
+            # No hop code in the frame - a decoder or a future fob that doesn't
+            # report one. Fall back to the old repeat-bit filter, which is
+            # lossy but is still better than dispatching every frame of a burst
+            # as a separate press. Confined to this branch so the fallback can
+            # never affect fobs that do report a code.
+            duplicate = repeat > 0
+            dedup_by = "repeat_bit"
+
+        if duplicate:
+            # Now means what the name always claimed: same press, already
+            # forwarded. dedup_by records which rule made the call, so a future
+            # regression (or a fob silently falling back) is one query away, and
+            # the raw frame is still kept for offline analysis.
             db_handler.log_event(
                 event_id,
                 db_handler.STAGE_RTL_LISTENER,
                 db_handler.STATE_DROPPED_REPEAT,
                 event_key=event_key,
-                payload={"repeat": repeat, "raw": data},
+                payload={"repeat": repeat, "hop_code": hop_code,
+                         "dedup_by": dedup_by, "raw": data},
             )
             continue
 
@@ -167,13 +266,24 @@ def _read_stdout(stream, state, event_queue):
             db_handler.STAGE_RTL_LISTENER,
             db_handler.STATE_RECEIVED,
             event_key=event_key,
-            payload={"raw": data},
+            # hop_code lifted out of the raw frame so RECEIVED and
+            # DROPPED_REPEAT rows can be grouped by the same json_extract path
+            # - that grouping is the whole diagnosis in entry 04.
+            payload={"hop_code": hop_code, "repeat": repeat, "raw": data},
             timestamp=event["timestamp"],
         )
         try:
             event_queue.put(event, block=True, timeout=1)
         except Exception:
             logger.warning("Event queue full - dropping button-press event to avoid unbounded memory growth")
+            # Release the hop code so the rest of this burst can retry. Without
+            # this the fix would trade one silent loss for another: the first
+            # frame claims the press, fails to queue it, and every retransmission
+            # that could still have carried it is then dropped as a duplicate.
+            # Re-queuing on a later frame is exactly the redundancy the fob
+            # provides, now applied to backpressure as well as to lost frames.
+            if hop_key is not None:
+                _forget(hop_key)
             # Trail row so a press lost to backpressure is distinguishable from
             # one that was never decoded at all - the RECEIVED row above says
             # the RF side worked, this one says the pipeline dropped it.
